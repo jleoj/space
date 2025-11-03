@@ -20,12 +20,18 @@ dotenv.config();
 ServerResponse.prototype.setMaxListeners(50);
 ServerResponse.prototype.setMaxListeners(50);
 
-const port = 2345, server = createServer(), bare = createBareServer("/seal/");
+const port = process.env.PORT || 2345; // ✅ use Render port when deployed
+const server = createServer();
+const bare = createBareServer("/seal/");
+
 server.on("upgrade", (req, sock, head) =>
-  bare.shouldRoute(req) ? bare.routeUpgrade(req, sock, head)
-  : req.url.endsWith("/wisp/") ? wisp.routeRequest(req, sock, head)
-  : sock.end()
+  bare.shouldRoute(req)
+    ? bare.routeUpgrade(req, sock, head)
+    : req.url.endsWith("/wisp/")
+      ? wisp.routeRequest(req, sock, head)
+      : sock.end()
 );
+
 
 const app = Fastify({
   serverFactory: h => (server.on("request", (req,res) =>
@@ -34,20 +40,9 @@ const app = Fastify({
 
 });
 
-// Get the port from Render
-const PORT = process.env.PORT || 3000;
-
-// Start the server
-const start = async () => {
-  try {
-    await app.listen({ port: PORT, host: '0.0.0.0' });
-    console.log(`Server running on port ${PORT}`);
-  } catch (err) {
-    app.log.error(err);
-    process.exit(1);
-  }
-};
-
+server.listen(port, "0.0.0.0", () => {
+  console.log(`Server running on port ${port}`);
+});
 
 // Enforce HTTPS (redirect HTTP to HTTPS)
 if (process.env.FORCE_HTTPS === "true") {
