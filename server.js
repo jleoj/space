@@ -1,4 +1,4 @@
-// server.js (ESM)
+// server.js (ESM) — Render-ready, Fastify + Bare + Wisp
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -13,7 +13,6 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { access } from "node:fs/promises";
 
-// third-party asset paths used in your original file
 import { epoxyPath } from "@mercuryworkshop/epoxy-transport";
 import { libcurlPath } from '@mercuryworkshop/libcurl-transport';
 import { baremuxPath } from "@mercuryworkshop/bare-mux/node";
@@ -22,49 +21,62 @@ import { uvPath } from "@titaniumnetwork-dev/ultraviolet";
 
 import { MasqrMiddleware } from "./masqr.js";
 
-// ---- utils ----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// PORT
+// PORT supplied by Render in production; fallback for local dev
 const PORT = Number(process.env.PORT) || 3000;
 
-// Create the raw Node server and the bare server instance
+// Create raw Node server and Bare instance
 const server = createServer();
 const bare = createBareServer("/seal/");
 
-// Important: provide a basic HTTP root handler so Render can detect the port.
-// We'll attach a request handler to the raw server. Fastify's serverFactory
-// will reuse this same server instance so we only have one listener.
+// We'll store Fastify's handler here so our single Node server can delegate to it
+let fastifyHandler = null;
+
+// Single raw request listener:
+// - Responds to "/" and "/health" for Render detection & health checks
+// - Lets bare handle its routes (routeRequest)
+// - Lets wisp handle normal http requests that end with "/wisp/"
+// - Otherwise delegates to Fastify when ready
 server.on("request", (req, res) => {
   try {
-    // simple health and root endpoints for detection and health checks
+    // Basic detection / health endpoints
     if (req.url === "/" || req.url === "/health") {
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end(req.url === "/health" ? "ok" : "Bare+Fastify server");
       return;
     }
 
-    // Prefer bare routing when appropriate
+    // Bare routing (static/bare endpoints)
     if (bare.shouldRoute(req)) {
       bare.routeRequest(req, res);
       return;
     }
 
-    // If the URL ends with /wisp/ handle via wisp (upgrade-based)
+    // Wisp plain HTTP request handler (non-upgrade)
     if (req.url.endsWith("/wisp/")) {
-      // wisp.routeRequest expects (req, socket, head) when upgrade OR (req, res) for normal
-      // Using routeRequest(req, res) here to forward normal HTTP requests
-      wisp.routeRequest(req, res);
+      try {
+        wisp.routeRequest(req, res);
+      } catch (e) {
+        // fallback to Fastify or 500
+        console.error("wisp routeRequest error:", e);
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end("wisp error");
+      }
       return;
     }
 
-    // default 404 fallback (Render will still see a valid HTTP listener)
+    // Delegate to Fastify if it has registered its handler
+    if (fastifyHandler) {
+      return fastifyHandler(req, res);
+    }
+
+    // Default fallback (before Fastify ready)
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Not Found");
   } catch (err) {
-    // fail safe
-    console.error("Unhandled raw request error:", err);
+    console.error("Raw request handler error:", err);
     try {
       res.writeHead(500, { "Content-Type": "text/plain" });
       res.end("Internal Server Error");
@@ -72,7 +84,7 @@ server.on("request", (req, res) => {
   }
 });
 
-// upgrade handling for WebSocket / bare / wisp
+// Upgrade handling for websockets / bare / wisp
 server.on("upgrade", (req, sock, head) => {
   if (bare.shouldRoute(req)) {
     return bare.routeUpgrade(req, sock, head);
@@ -83,44 +95,31 @@ server.on("upgrade", (req, sock, head) => {
   sock.end();
 });
 
-// ---- Fastify setup using serverFactory to reuse the same `server` ----
+// ---- Fastify setup: we return the same `server` instance via serverFactory
 const app = Fastify({
   logger: false,
-  serverFactory: handler => {
-    // attach Fastify's request handler to our node `server`
-    server.on("request", (req, res) => {
-      // If bare handles the request, do not pass it to Fastify
-      if (bare.shouldRoute(req) || req.url.endsWith("/wisp/")) {
-        // Let raw server handlers handle it (we already attach bare above)
-        return;
-      }
-      handler(req, res);
-    });
-
-    // return the Node server — Fastify will not call .listen() itself
+  serverFactory: (handler) => {
+    // capture Fastify's handler so our single raw server can call it
+    fastifyHandler = handler;
     return server;
   }
 });
 
-// Optional: redirect HTTP->HTTPS when Render terminates TLS and sets x-forwarded-proto
+// Optional HTTPS redirect when Render terminates TLS (FORCE_HTTPS=true)
 if (process.env.FORCE_HTTPS === "true") {
   app.addHook("onRequest", async (req, reply) => {
     const proto = req.headers["x-forwarded-proto"];
     if (proto === "http") {
-      // preserve host + path
       reply.redirect(301, `https://${req.headers.host}${req.raw.url}`);
     }
   });
 }
 
-// Security headers
+// Security, cookies
 await app.register(fastifyHelmet, { contentSecurityPolicy: false });
-
-// cookies
 await app.register(fastifyCookie);
 
-// Static mounts — make sure each root exists in production or Render will error at startup.
-// For bundles that may not be present, we keep them but don't crash.
+// Static mounts (skip missing roots without crashing)
 const staticRoots = [
   { root: join(__dirname, "public"), prefix: "/", decorateReply: true },
   { root: libcurlPath, prefix: "/libcurl/" },
@@ -132,7 +131,6 @@ const staticRoots = [
 ];
 
 for (const r of staticRoots) {
-  // register each static route, but skip if the folder doesn't exist (non-fatal)
   try {
     await access(r.root);
     await app.register(fastifyStatic, {
@@ -141,12 +139,11 @@ for (const r of staticRoots) {
       decorateReply: r.decorateReply || false
     });
   } catch {
-    // missing optional asset dir — log but continue
     app.log.info(`Static root not found, skipping: ${r.root}`);
   }
 }
 
-// uv route: prefer local dist/uv if exists, otherwise fall back to uvPath
+// uv route: prefer local built dist/uv if present, otherwise fall back to packaged uvPath
 app.get("/uv/*", async (req, reply) => {
   const name = req.params["*"];
   const localRoot = join(__dirname, "dist/uv");
@@ -154,7 +151,6 @@ app.get("/uv/*", async (req, reply) => {
     await access(join(localRoot, name));
     return reply.sendFile(name, localRoot);
   } catch {
-    // fallback to packaged uvPath
     return reply.sendFile(name, uvPath);
   }
 });
@@ -164,36 +160,33 @@ if (process.env.MASQR === "true") {
   app.addHook("onRequest", MasqrMiddleware);
 }
 
-// ---- Proxy helper ----
+// ---- Proxy helper (kept small & memory-cached) ----
 const proxy = (urlFactory, defaultType = "application/javascript") => {
-  // basic in-memory cache for simple GET caching (very small)
   const cache = new Map();
 
   return async (req, reply) => {
-    // blocklist of tracking domains (copied from your list — can be trimmed)
     const trackingDomains = [
       'trk.pinterest.com', 'widgets.pinterest.com', 'events.reddit.com',
       'ads.youtube.com', 'ads-api.tiktok.com', 'analytics.tiktok.com',
-      'adservice.google.com', 'google-analytics.com', 'ad.doubleclick.net',
-      /* ... keep as needed ... */
+      'adservice.google.com', 'google-analytics.com', 'ad.doubleclick.net'
+      // trim or expand as needed
     ];
 
     const target = typeof urlFactory === "function" ? urlFactory(req) : urlFactory;
+    if (!target) return reply.code(400).send({ error: "bad target" });
+
     if (trackingDomains.some(d => target.includes(d))) {
       return reply.code(403).type("text/plain").send("Blocked tracking domain");
     }
 
-    // strip cookies / add DNT
+    // strip cookies + set DNT
     req.headers.cookie = "";
     req.headers.dnt = "1";
 
     const cacheKey = req.method === "GET" ? target : null;
     if (cacheKey && cache.has(cacheKey)) {
       const cached = cache.get(cacheKey);
-      // set headers that are safe
-      for (const [k, v] of Object.entries(cached.headers || {})) {
-        reply.header(k, v);
-      }
+      for (const [k, v] of Object.entries(cached.headers || {})) reply.header(k, v);
       reply.type(cached.type || defaultType);
       return reply.send(cached.body);
     }
@@ -202,7 +195,6 @@ const proxy = (urlFactory, defaultType = "application/javascript") => {
       const res = await fetch(target, { method: req.method, headers: req.headers });
       if (!res.ok) return reply.code(res.status).send();
 
-      // copy safe headers
       const headersToStrip = new Set([
         'content-security-policy', 'x-frame-options', 'x-content-type-options',
         'cross-origin-embedder-policy', 'cross-origin-opener-policy',
@@ -220,10 +212,9 @@ const proxy = (urlFactory, defaultType = "application/javascript") => {
       }
 
       let bodyBuffer = Buffer.from(await res.arrayBuffer());
-      let contentType = res.headers.get("content-type") || defaultType;
+      const contentType = res.headers.get("content-type") || defaultType;
       reply.type(contentType);
 
-      // compression: compress if client accepts and response is compressible
       const acceptEncoding = (req.headers['accept-encoding'] || "");
       if (acceptEncoding.includes("br")) {
         const { brotliCompressSync } = await import("zlib");
@@ -235,14 +226,9 @@ const proxy = (urlFactory, defaultType = "application/javascript") => {
         reply.header("Content-Encoding", "gzip");
       }
 
-      // cache GET results (tiny, memory-only)
       if (cacheKey) {
         cache.set(cacheKey, { headers: safeHeaders, type: contentType, body: bodyBuffer });
-        // optional: simple size-based eviction
-        if (cache.size > 200) {
-          const firstKey = cache.keys().next().value;
-          cache.delete(firstKey);
-        }
+        if (cache.size > 200) cache.delete(cache.keys().next().value);
       }
 
       return reply.send(bodyBuffer);
@@ -253,11 +239,10 @@ const proxy = (urlFactory, defaultType = "application/javascript") => {
   };
 };
 
-// Routes using proxy
-app.get("/*", proxy(req => `${req.params["*"]}`, "text/html")); // generic proxy for wildcard (be careful)
+// ---- Application routes (specific files first) ----
 app.get("/js/script.js", proxy(() => "https://byod.privatedns.org/js/script.js"));
 
-// Specific routes (static pages)
+// Static HTML pages
 app.get("/", async (req, reply) => reply.sendFile("index.html"));
 app.get("/&", async (req, reply) => reply.sendFile("&.html"));
 app.get("/~", async (req, reply) => reply.sendFile("~.html"));
@@ -279,18 +264,30 @@ app.get("/return", async (req, reply) => {
   }
 });
 
-// 404 handler
+// ---- Not-found handler: acts as your previous "/*" proxy fallback ----
 app.setNotFoundHandler((req, reply) => {
-  if (req.raw.method === "GET" && (req.headers.accept || "").includes("text/html")) {
-    return reply.sendFile("err.html");
-  }
-  return reply.code(404).send({ error: "Not Found" });
+  // Only proxy GET requests (matches previous behavior)
+  if (req.raw.method !== "GET") return reply.code(404).send({ error: "Not Found" });
+
+  // Original pattern used req.params["*"], which captured the path after leading /
+  // We reconstruct that: strip leading "/" from raw URL (including query)
+  const target = req.raw.url?.slice(1) || "";
+  if (!target) return reply.code(404).send({ error: "Not Found" });
+
+  // Use the proxy helper to proxy the reconstructed target
+  return proxy(() => target, "text/html")(req, reply);
 });
 
-// ---- Start sequence ----
-await app.ready(); // initialize plugins, routes, static mounts, etc.
+// 404 fallback for non-GET already handled by setNotFoundHandler above
+app.setErrorHandler((err, req, reply) => {
+  app.log.error(err);
+  reply.code(500).send({ error: "Internal Server Error" });
+});
 
-// Listen on the raw Node server (only one .listen call)
+// ---- Startup ----
+await app.ready(); // ensure plugins/routes/static are ready
+
+// Only single listen on the raw Node server; Fastify will use the same server via serverFactory
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on ${PORT}`);
 });
