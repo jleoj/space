@@ -27,19 +27,27 @@ server.on("upgrade", (req, sock, head) =>
   : sock.end()
 );
 
-const PORT = process.env.PORT || 3000;
-
-// Bind to all interfaces
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server is running on port ${PORT}`);
-});
-
 const app = Fastify({
   serverFactory: h => (server.on("request", (req,res) =>
     bare.shouldRoute(req) ? bare.routeRequest(req,res) : h(req,res)), server),
   logger: false
 
 });
+
+// Get the port from Render
+const PORT = process.env.PORT || 3000;
+
+// Start the server
+const start = async () => {
+  try {
+    await app.listen({ port: PORT, host: '0.0.0.0' });
+    console.log(`Server running on port ${PORT}`);
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+};
+
 
 // Enforce HTTPS (redirect HTTP to HTTPS)
 if (process.env.FORCE_HTTPS === "true") {
